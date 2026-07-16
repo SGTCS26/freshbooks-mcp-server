@@ -17,24 +17,65 @@ import type { StoredTokens } from './freshbooks/types.js';
 // ── Token persistence ─────────────────────────────────────────────────────────
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 
-const TOKEN_DIR = join(homedir(), '.freshbooks-mcp');
-const TOKEN_FILE = join(TOKEN_DIR, 'tokens.json');
+// Canonical single token store (reconciled 2026-07-16). The old private store
+// ~/.freshbooks-mcp/tokens.json diverged from the financial-intelligence store
+// (FreshBooks rotates refresh tokens, so two independent refreshers kill each
+// other's chain). Every consumer now shares the one file the Python ingest
+// pipeline refreshes; FRESHBOOKS_TOKEN_PATH overrides for tests.
+const TOKEN_FILE =
+  process.env.FRESHBOOKS_TOKEN_PATH ??
+  join(
+    homedir(),
+    'CascadeProjects/apps/silvergate/financial-intelligence/data/freshbooks_token.json'
+  );
+
+/** Canonical-store expires_at is epoch SECONDS (float, python time.time());
+ *  legacy/env flows used epoch ms; tolerate both plus ISO strings. */
+function toEpochMs(v: unknown): number {
+  if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;
+  if (typeof v === 'string') {
+    const t = Date.parse(v);
+    if (!Number.isNaN(t)) return t;
+  }
+  return 0;
+}
+
+// Extra canonical-store fields (account_id, saved_at, ...) that must survive a
+// round-trip through this process — the Python consumers depend on them.
+let canonicalExtras: Record<string, unknown> = {};
 
 async function loadTokens(): Promise<StoredTokens | null> {
   try {
     const raw = await readFile(TOKEN_FILE, 'utf8');
-    return JSON.parse(raw) as StoredTokens;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const { access_token, refresh_token, expires_at, ...rest } = parsed;
+    canonicalExtras = rest;
+    if (typeof access_token !== 'string' || typeof refresh_token !== 'string') return null;
+    return {
+      access_token,
+      refresh_token,
+      expires_at: toEpochMs(expires_at),
+    } as StoredTokens;
   } catch {
     return null;
   }
 }
 
 async function saveTokens(tokens: StoredTokens): Promise<void> {
-  await mkdir(TOKEN_DIR, { recursive: true });
-  await writeFile(TOKEN_FILE, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+  await mkdir(dirname(TOKEN_FILE), { recursive: true });
+  // Persist in the canonical schema: epoch-seconds expires_at + preserved
+  // extras (account_id etc.), so the Python pipeline keeps working.
+  const body = {
+    ...canonicalExtras,
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    expires_at: tokens.expires_at / 1000,
+    saved_at: Date.now() / 1000,
+  };
+  await writeFile(TOKEN_FILE, JSON.stringify(body, null, 2), { mode: 0o600 });
 }
 
 async function refreshIfNeeded(tokens: StoredTokens): Promise<StoredTokens> {
@@ -104,8 +145,8 @@ async function resolveAccessToken(): Promise<string> {
       'Provide one of:\n' +
       '  • FRESHBOOKS_ACCESS_TOKEN env var\n' +
       '  • FRESHBOOKS_REFRESH_TOKEN + FRESHBOOKS_CLIENT_ID + FRESHBOOKS_CLIENT_SECRET env vars\n' +
-      '  • Run the HTTP server first (MODE=http) and complete OAuth in a browser,\n' +
-      '    then tokens will be stored in ~/.freshbooks-mcp/tokens.json\n'
+      '  • Re-auth the canonical store: python3 scripts/freshbooks_reauth.py in\n' +
+      '    apps/silvergate/financial-intelligence (writes data/freshbooks_token.json)\n'
   );
   process.exit(1);
 }
