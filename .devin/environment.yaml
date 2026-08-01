@@ -1,0 +1,26 @@
+initialize:
+  - run: |
+      set -e
+      brew install node@22 2>/dev/null || true
+      export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+      npm install
+      npm run build
+maintenance:
+  - run: |
+      export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:$PATH"
+      npm install --quiet 2>/dev/null || true
+knowledge:
+  - name: lint
+    contents: |
+      npx tsc --noEmit
+  - name: test
+    contents: |
+      npm run build
+  - name: startup
+    contents: |
+      # stdio mode (Claude Desktop / MCP Inspector)
+      npm run dev
+      # HTTP mode (claude.ai custom connector):
+      #   MODE=http npm run dev:http
+      # Requires .env with FRESHBOOKS_CLIENT_ID and FRESHBOOKS_CLIENT_SECRET
+      # Get credentials at https://my.freshbooks.com/#/developer
