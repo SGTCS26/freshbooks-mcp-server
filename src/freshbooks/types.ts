@@ -297,4 +297,9 @@ export interface StoredTokens {
   access_token: string;
   refresh_token: string;
   expires_at: number; // Unix ms
+  // Optional, added by the OAuth hardening. Entries written before it lack
+  // these fields and are read as "legacy" (see src/oauth.ts).
+  kind?: 'access' | 'refresh';
+  session_expires_at?: number; // Unix ms
+  client_id?: string;
 }

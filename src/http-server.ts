@@ -35,21 +35,38 @@ import { config, getOAuthCallbackUri } from './config.js';
 import { buildMcpServer, createMcpServer } from './mcp-server.js';
 import { FreshBooksClient } from './freshbooks/client.js';
 import { sessionStore } from './session-store.js';
+import {
+  OAuthError,
+  authenticateClient,
+  checkBearerEntry,
+  isRefreshEntry,
+  newAccessEntry,
+  newRefreshEntry,
+  oauthSettings,
+  registerClient,
+  validateAuthorizeRequest,
+  verifyPkce,
+  type PendingAuthorization,
+} from './oauth.js';
 import type { StoredTokens } from './freshbooks/types.js';
 
 /** Maps our auth code → { freshbooksTokens, clientRedirectUri } (short-lived, in-memory is fine) */
 
-const pendingCodes = new Map<string, { tokens: StoredTokens; redirectUri: string; state: string }>();
+const pendingCodes = new Map<
+  string,
+  { tokens: StoredTokens; redirectUri: string; state: string; clientId: string; codeChallenge: string }
+>();
 
-/** Dynamic OAuth clients registered by claude.ai */
-interface OAuthClient {
-  client_id: string;
-  client_secret: string;
-  redirect_uris: string[];
-  client_name?: string;
-  token_endpoint_auth_method: string;
+/** Maps the opaque state we send to FreshBooks → the validated /authorize request (5 min). */
+const pendingAuthorizations = new Map<string, PendingAuthorization>();
+
+function sendOAuthError(res: Response, err: unknown): boolean {
+  if (err instanceof OAuthError) {
+    res.status(err.status).json({ error: err.error, error_description: err.description });
+    return true;
+  }
+  return false;
 }
-const registeredClients = new Map<string, OAuthClient>();
 
 // ── Active transports ────────────────────────────────────────────────────
 const sseTransports = new Map<string, SSEServerTransport>();
@@ -76,10 +93,18 @@ async function getValidTokens(sessionToken: string): Promise<StoredTokens | null
   let stored = sessionStore.get(sessionToken);
   if (!stored) return null;
 
+  // Session TTL / refresh-token-as-Bearer / legacy policy (see src/oauth.ts)
+  const verdict = checkBearerEntry(stored, (k) => sessionStore.get(k));
+  if (verdict !== 'ok') {
+    console.log(`[OAuth] bearer rejected: ${verdict}`);
+    return null;
+  }
+
   // Refresh 60 seconds before expiry
   if (stored.expires_at - Date.now() < 60_000) {
     try {
-      stored = await refreshFreshBooksToken(stored);
+      // Keep the session metadata (kind, TTL, client) when FreshBooks tokens rotate.
+      stored = { ...stored, ...(await refreshFreshBooksToken(stored)) };
       sessionStore.set(sessionToken, stored);
     } catch {
       sessionStore.delete(sessionToken);
@@ -177,8 +202,8 @@ export function createHttpServer() {
       registration_endpoint: `${config.server.url}/oauth/register`,
       response_types_supported: ['code'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
-      token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
-      code_challenge_methods_supported: ['S256', 'plain'],
+      token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic', 'none'],
+      code_challenge_methods_supported: ['S256'],
       scopes_supported: ['freshbooks'],
     });
   });
@@ -186,18 +211,15 @@ export function createHttpServer() {
   // ── Dynamic client registration (RFC 7591) ────────────────────────────────
 
   app.post('/oauth/register', (req, res) => {
-    const clientId = randomUUID();
-    const clientSecret = randomUUID();
-    const client: OAuthClient = {
-      client_id: clientId,
-      client_secret: clientSecret,
-      redirect_uris: req.body.redirect_uris ?? [],
-      client_name: req.body.client_name,
-      token_endpoint_auth_method: req.body.token_endpoint_auth_method ?? 'client_secret_post',
-    };
-    registeredClients.set(clientId, client);
+    let client, clientSecret: string;
+    try {
+      ({ client, client_secret: clientSecret } = registerClient((req.body ?? {}) as Record<string, unknown>));
+    } catch (err) {
+      if (sendOAuthError(res, err)) return;
+      throw err;
+    }
     res.status(201).json({
-      client_id: clientId,
+      client_id: client.client_id,
       client_secret: clientSecret,
       redirect_uris: client.redirect_uris,
       client_name: client.client_name,
@@ -212,15 +234,19 @@ export function createHttpServer() {
     const { redirect_uri, state, client_id } = req.query as Record<string, string>;
     console.log(`[OAuth] /authorize called — client_id=${client_id}, redirect_uri=${redirect_uri}, state=${state?.slice(0, 20)}...`);
 
-    if (!redirect_uri) {
-      console.log('[OAuth] /authorize rejected: missing redirect_uri');
-      res.status(400).send('Missing redirect_uri');
-      return;
+    let pending: PendingAuthorization;
+    try {
+      pending = validateAuthorizeRequest(req.query as Record<string, unknown>);
+    } catch (err) {
+      if (err instanceof OAuthError) console.log(`[OAuth] /authorize rejected: ${err.error}`);
+      if (sendOAuthError(res, err)) return;
+      throw err;
     }
 
-    // Store redirect info in state so the callback can use it
-    const oauthState = JSON.stringify({ redirect_uri, state, client_id });
-    const encodedState = Buffer.from(oauthState).toString('base64url');
+    // Keep the validated request server-side; FreshBooks only sees an opaque nonce.
+    const encodedState = randomUUID();
+    pendingAuthorizations.set(encodedState, pending);
+    setTimeout(() => pendingAuthorizations.delete(encodedState), 5 * 60 * 1000).unref();
 
     const callbackUri = getOAuthCallbackUri();
     console.log(`[OAuth] Redirecting to FreshBooks — callback_uri=${callbackUri}`);
@@ -258,16 +284,16 @@ export function createHttpServer() {
     // Skip the proxy redirect and show the session token in the browser instead.
     const isLocalTest = state === 'local-test';
 
-    let decoded: { redirect_uri: string; state: string; client_id: string } | null = null;
+    let decoded: PendingAuthorization | null = null;
     if (!isLocalTest) {
-      try {
-        decoded = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
-        console.log(`[OAuth] Decoded state — redirect_uri=${decoded?.redirect_uri}, client_id=${decoded?.client_id}`);
-      } catch {
-        console.error('[OAuth] Failed to decode state parameter');
+      decoded = pendingAuthorizations.get(state) ?? null;
+      pendingAuthorizations.delete(state);
+      if (!decoded) {
+        console.error('[OAuth] Unknown or expired state parameter');
         res.status(400).send('Invalid state parameter');
         return;
       }
+      console.log(`[OAuth] State matched — redirect_uri=${decoded.redirect_uri}, client_id=${decoded.client_id}`);
     }
 
     // Exchange the FreshBooks code for tokens
@@ -300,10 +326,9 @@ export function createHttpServer() {
     await writeFile(join(tokenDir, 'tokens.json'), JSON.stringify(tokens, null, 2), { mode: 0o600 });
 
     // Issue our own session token
-    const sessionToken = randomUUID();
-    sessionStore.set(sessionToken, tokens);
-
     if (isLocalTest) {
+      const sessionToken = randomUUID();
+      sessionStore.set(sessionToken, newAccessEntry(tokens));
       const tokenRow = (id: string, label: string, subtitle: string, value: string, envKey?: string) => `
           <h3>${label} <small style="font-weight:normal;color:#666">(${subtitle})</small></h3>
           <div style="display:flex;align-items:center;gap:0.5rem;background:#f4f4f4;border:1px solid #ddd;border-radius:4px;padding:0.5rem 0.75rem">
@@ -360,10 +385,12 @@ export function createHttpServer() {
       tokens,
       redirectUri: decoded!.redirect_uri,
       state: decoded!.state,
+      clientId: decoded!.client_id,
+      codeChallenge: decoded!.code_challenge,
     });
 
     // Expire the code after 5 minutes
-    setTimeout(() => pendingCodes.delete(ourCode), 5 * 60 * 1000);
+    setTimeout(() => pendingCodes.delete(ourCode), 5 * 60 * 1000).unref();
 
     const redirectParams = new URLSearchParams({ code: ourCode, state: decoded!.state });
     res.redirect(`${decoded!.redirect_uri}?${redirectParams.toString()}`);
@@ -374,70 +401,90 @@ export function createHttpServer() {
 
   app.post('/oauth/token', (req, res) => {
     console.log(`[OAuth] /token called — grant_type=${req.body?.grant_type}, code=${req.body?.code ? 'present' : 'absent'}`);
-    const { grant_type, code, refresh_token: incomingRefreshToken } = req.body as Record<string, string>;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const { grant_type, code, redirect_uri, code_verifier, refresh_token: incomingRefreshToken } = body as Record<string, string>;
 
-    if (grant_type === 'authorization_code') {
-      if (!code) {
-        res.status(400).json({ error: 'invalid_request', error_description: 'Missing code' });
+    try {
+      if (grant_type === 'authorization_code') {
+        const client = authenticateClient(body, req.headers.authorization);
+        if (!code) throw new OAuthError(400, 'invalid_request', 'Missing code');
+
+        const pending = pendingCodes.get(code);
+        if (!pending) throw new OAuthError(400, 'invalid_grant', 'Code not found or expired');
+        pendingCodes.delete(code); // single use, even when a check below fails
+
+        if (pending.clientId !== client.client_id) {
+          throw new OAuthError(400, 'invalid_grant', 'Code was issued to another client');
+        }
+        if (redirect_uri !== pending.redirectUri) {
+          throw new OAuthError(400, 'invalid_grant', 'redirect_uri does not match the authorization request');
+        }
+        if (!verifyPkce(code_verifier, pending.codeChallenge)) {
+          throw new OAuthError(400, 'invalid_grant', 'PKCE verification failed');
+        }
+
+        const sessionToken = randomUUID();
+        const refreshToken = randomUUID();
+        sessionStore.set(sessionToken, newAccessEntry(pending.tokens, client.client_id));
+        // Store the refresh token → session token mapping
+        sessionStore.set(refreshToken, newRefreshEntry(pending.tokens, sessionToken, client.client_id));
+
+        res.json({
+          access_token: sessionToken,
+          refresh_token: refreshToken,
+          token_type: 'bearer',
+          expires_in: Math.floor(oauthSettings.sessionTtlMs / 1000),
+        });
         return;
       }
 
-      const pending = pendingCodes.get(code);
-      if (!pending) {
-        res.status(400).json({ error: 'invalid_grant', error_description: 'Code not found or expired' });
+      if (grant_type === 'refresh_token') {
+        if (!incomingRefreshToken) throw new OAuthError(400, 'invalid_request', 'Missing refresh_token');
+
+        const meta = sessionStore.get(incomingRefreshToken);
+        if (!meta || !isRefreshEntry(meta, (k) => sessionStore.get(k))) {
+          throw new OAuthError(400, 'invalid_grant', 'Refresh token not found');
+        }
+        if (meta.kind === 'refresh' && !(typeof meta.session_expires_at === 'number' && meta.session_expires_at > Date.now())) {
+          throw new OAuthError(400, 'invalid_grant', 'Refresh token expired');
+        }
+
+        // Client binding: new refresh tokens are bound to the client that got them.
+        // Unbound ones (written before this change) follow OAUTH_LEGACY_SESSIONS.
+        let boundClientId: string | undefined;
+        if (meta.client_id) {
+          const client = authenticateClient(body, req.headers.authorization);
+          if (client.client_id !== meta.client_id) {
+            throw new OAuthError(400, 'invalid_grant', 'Refresh token was issued to another client');
+          }
+          boundClientId = client.client_id;
+        } else if (oauthSettings.legacySessions === 'deny') {
+          throw new OAuthError(400, 'invalid_grant', 'Legacy refresh token rejected');
+        }
+
+        // The "access_token" field in the meta stored under refresh token is the old session token
+        const oldSessionToken = meta.access_token;
+        const freshbooksTokens = sessionStore.get(oldSessionToken);
+        if (!freshbooksTokens) throw new OAuthError(400, 'invalid_grant', 'Session not found');
+
+        const newSessionToken = randomUUID();
+        const newRefreshToken = randomUUID();
+        sessionStore.set(newSessionToken, newAccessEntry(freshbooksTokens, boundClientId));
+        sessionStore.set(newRefreshToken, newRefreshEntry(freshbooksTokens, newSessionToken, boundClientId));
+        sessionStore.delete(incomingRefreshToken);
+        sessionStore.delete(oldSessionToken);
+
+        res.json({
+          access_token: newSessionToken,
+          refresh_token: newRefreshToken,
+          token_type: 'bearer',
+          expires_in: Math.floor(oauthSettings.sessionTtlMs / 1000),
+        });
         return;
       }
-      pendingCodes.delete(code);
-
-      const sessionToken = randomUUID();
-      const refreshToken = randomUUID();
-      sessionStore.set(sessionToken, pending.tokens);
-      // Store the refresh token → session token mapping
-      sessionStore.set(refreshToken, { ...pending.tokens, access_token: sessionToken });
-
-      res.json({
-        access_token: sessionToken,
-        refresh_token: refreshToken,
-        token_type: 'bearer',
-        expires_in: Math.floor((pending.tokens.expires_at - Date.now()) / 1000),
-      });
-      return;
-    }
-
-    if (grant_type === 'refresh_token') {
-      if (!incomingRefreshToken) {
-        res.status(400).json({ error: 'invalid_request', error_description: 'Missing refresh_token' });
-        return;
-      }
-
-      const meta = sessionStore.get(incomingRefreshToken);
-      if (!meta) {
-        res.status(400).json({ error: 'invalid_grant', error_description: 'Refresh token not found' });
-        return;
-      }
-
-      // The "access_token" field in the meta stored under refresh token is the old session token
-      const oldSessionToken = meta.access_token;
-      const freshbooksTokens = sessionStore.get(oldSessionToken);
-      if (!freshbooksTokens) {
-        res.status(400).json({ error: 'invalid_grant', error_description: 'Session not found' });
-        return;
-      }
-
-      const newSessionToken = randomUUID();
-      const newRefreshToken = randomUUID();
-      sessionStore.set(newSessionToken, freshbooksTokens);
-      sessionStore.set(newRefreshToken, { ...freshbooksTokens, access_token: newSessionToken });
-      sessionStore.delete(incomingRefreshToken);
-      sessionStore.delete(oldSessionToken);
-
-      res.json({
-        access_token: newSessionToken,
-        refresh_token: newRefreshToken,
-        token_type: 'bearer',
-        expires_in: Math.floor((freshbooksTokens.expires_at - Date.now()) / 1000),
-      });
-      return;
+    } catch (err) {
+      if (sendOAuthError(res, err)) return;
+      throw err;
     }
 
     res.status(400).json({ error: 'unsupported_grant_type' });
