@@ -74,6 +74,56 @@ export class FreshBooksClient {
     if (!this.accountId) await this.resolveIdentity();
   }
 
+  // ── Bills (read-only, configured business only) ────────────────────────────
+
+  private billsAccountId = '';
+
+  /**
+   * Resolve the accounting account for FRESHBOOKS_BUSINESS_ID. Refuses when the
+   * env is unset or the token has no membership in that business, so bills are
+   * never read from another business the same login can see.
+   */
+  async resolveBillsAccount(): Promise<string> {
+    if (this.billsAccountId) return this.billsAccountId;
+    const configured = config.freshbooks.businessId.trim();
+    if (!/^[0-9]+$/.test(configured)) {
+      throw new Error('Bills tools are disabled: FRESHBOOKS_BUSINESS_ID is not set to a numeric business ID.');
+    }
+    const user = await this.getCurrentUser();
+    const membership = user.business_memberships?.find(
+      (m) => String(m.business.id) === configured
+    );
+    if (!membership) {
+      throw new Error(`Bills tools refused: this login has no membership in business ${configured}.`);
+    }
+    this.billsAccountId = membership.business.account_id;
+    return this.billsAccountId;
+  }
+
+  async listBills(opts: { page?: number; per_page?: number; vendor_id?: number } = {}): Promise<unknown> {
+    const accountId = await this.resolveBillsAccount();
+    const params = buildParams({
+      page: opts.page ?? 1,
+      per_page: opts.per_page ?? 25,
+      'search[vendorid]': opts.vendor_id,
+    });
+    const { data } = await this.http.get(`/accounting/account/${accountId}/bills/bills`, { params });
+    return data.response?.result ?? data;
+  }
+
+  async getBill(billId: number): Promise<unknown> {
+    const accountId = await this.resolveBillsAccount();
+    const { data } = await this.http.get(`/accounting/account/${accountId}/bills/bills/${billId}`);
+    return data.response?.result?.bill ?? data;
+  }
+
+  async listBillVendors(opts: { page?: number; per_page?: number } = {}): Promise<unknown> {
+    const accountId = await this.resolveBillsAccount();
+    const params = buildParams({ page: opts.page ?? 1, per_page: opts.per_page ?? 25 });
+    const { data } = await this.http.get(`/accounting/account/${accountId}/bill_vendors/bill_vendors`, { params });
+    return data.response?.result ?? data;
+  }
+
   // ── Clients ─────────────────────────────────────────────────────────────────
 
   async listClients(opts: {

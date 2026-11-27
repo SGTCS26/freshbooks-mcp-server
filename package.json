@@ -13,7 +13,9 @@
     "start": "node --env-file=.env dist/index.js",
     "serve": "MODE=http node --env-file=.env dist/index.js",
     "dev:http": "MODE=http node --env-file=.env --import tsx/esm src/index.ts",
-    "auth-url": "node --env-file=.env --import tsx/esm src/scripts/auth-url.ts"
+    "auth-url": "node --env-file=.env --import tsx/esm src/scripts/auth-url.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx/esm --test --test-force-exit test/*.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.10.0",
