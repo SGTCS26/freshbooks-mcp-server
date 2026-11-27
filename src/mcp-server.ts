@@ -9,6 +9,74 @@ import { registerProjectTools } from './tools/projects.js';
 import { registerTimeEntryTools } from './tools/time-entries.js';
 import { registerItemTools } from './tools/items.js';
 import { registerServiceTools } from './tools/services.js';
+import { registerBillTools } from './tools/bills.js';
+import {
+  assertAllowlistKnown,
+  isToolAllowed,
+  resolveToolPolicy,
+  type ToolPolicy,
+} from './tool-policy.js';
+
+const MODULES = [
+  registerUserTools,
+  registerClientTools,
+  registerInvoiceTools,
+  registerExpenseTools,
+  registerPaymentTools,
+  registerProjectTools,
+  registerTimeEntryTools,
+  registerItemTools,
+  registerServiceTools,
+  registerBillTools,
+];
+
+export interface BuiltMcpServer {
+  server: McpServer;
+  /** Names actually registered (sorted). */
+  registered: string[];
+  /** Every name a module tried to register (sorted). */
+  defined: string[];
+  policy: ToolPolicy;
+}
+
+/**
+ * Build the server, applying the tool policy before any tool reaches the
+ * SDK. Tools that the policy rejects are never registered, so they do not
+ * appear in tools/list and cannot be called.
+ */
+export function buildMcpServer(
+  getClient: () => FreshBooksClient,
+  env: NodeJS.ProcessEnv = process.env
+): BuiltMcpServer {
+  const policy = resolveToolPolicy(env);
+  const server = new McpServer({
+    name: 'freshbooks-mcp-server',
+    version: '1.0.0',
+  });
+
+  const defined: string[] = [];
+  const registered: string[] = [];
+  const gated = new Proxy(server, {
+    get(target, prop, receiver) {
+      if (prop === 'tool' || prop === 'registerTool') {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const original = (target as any)[prop].bind(target);
+        return (name: string, ...rest: unknown[]) => {
+          defined.push(name);
+          if (!isToolAllowed(name, policy)) return undefined;
+          registered.push(name);
+          return original(name, ...rest);
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+
+  for (const register of MODULES) register(gated, getClient);
+  assertAllowlistKnown(policy, defined);
+
+  return { server, registered: registered.sort(), defined: defined.sort(), policy };
+}
 
 /**
  * Create and configure a FreshBooks MCP server.
@@ -18,20 +86,5 @@ import { registerServiceTools } from './tools/services.js';
  *                   refresh can happen transparently.
  */
 export function createMcpServer(getClient: () => FreshBooksClient): McpServer {
-  const server = new McpServer({
-    name: 'freshbooks-mcp-server',
-    version: '1.0.0',
-  });
-
-  registerUserTools(server, getClient);
-  registerClientTools(server, getClient);
-  registerInvoiceTools(server, getClient);
-  registerExpenseTools(server, getClient);
-  registerPaymentTools(server, getClient);
-  registerProjectTools(server, getClient);
-  registerTimeEntryTools(server, getClient);
-  registerItemTools(server, getClient);
-  registerServiceTools(server, getClient);
-
-  return server;
+  return buildMcpServer(getClient).server;
 }

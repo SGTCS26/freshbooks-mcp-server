@@ -32,7 +32,7 @@ import axios from 'axios';
 import { randomUUID } from 'node:crypto';
 import selfsigned from 'selfsigned';
 import { config, getOAuthCallbackUri } from './config.js';
-import { createMcpServer } from './mcp-server.js';
+import { buildMcpServer, createMcpServer } from './mcp-server.js';
 import { FreshBooksClient } from './freshbooks/client.js';
 import { sessionStore } from './session-store.js';
 import type { StoredTokens } from './freshbooks/types.js';
@@ -573,8 +573,16 @@ export async function startHttpServer() {
     process.exit(1);
   }
 
+  // Apply the tool policy once at startup so a bad TOOL_ALLOWLIST fails here,
+  // and log the exposed tool names (names only).
+  const built = buildMcpServer(() => new FreshBooksClient(''));
+  console.log(
+    `[MCP] tool policy read_only=${built.policy.readOnly} registered=${built.registered.length}: ${built.registered.join(',')}`
+  );
+
   const app = createHttpServer();
   const port = config.server.port;
+  const host = config.server.bindHost;
 
   if (config.server.https) {
     // Self-signed cert for local HTTPS testing (browser OAuth flow).
@@ -584,15 +592,15 @@ export async function startHttpServer() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       { days: 365, keySize: 2048 } as any
     );
-    https.createServer({ key: pems.private, cert: pems.cert }, app).listen(port, onListening);
+    https.createServer({ key: pems.private, cert: pems.cert }, app).listen(port, host, onListening);
   } else {
     // Plain HTTP — intended for use behind ngrok or another TLS-terminating proxy.
-    app.listen(port, onListening);
+    app.listen(port, host, onListening);
   }
 
   function onListening() {
     const proto = config.server.https ? 'HTTPS (self-signed)' : 'HTTP';
-    console.log(`FreshBooks MCP Server (${proto}) listening on port ${port}`);
+    console.log(`FreshBooks MCP Server (${proto}) listening on ${host}:${port}`);
     console.log(`  SSE endpoint:    ${config.server.url}/sse`);
     console.log(`  OAuth authorize: ${config.server.url}/oauth/authorize`);
     console.log(`  OAuth callback:  ${getOAuthCallbackUri()}`);

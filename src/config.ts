@@ -3,6 +3,10 @@ export const config = {
     clientId: process.env.FRESHBOOKS_CLIENT_ID ?? '',
     clientSecret: process.env.FRESHBOOKS_CLIENT_SECRET ?? '',
     apiBase: process.env.FRESHBOOKS_API_BASE ?? 'https://api.freshbooks.com',
+    // Business that the read-only bills tools are scoped to (numeric FreshBooks business ID).
+    get businessId(): string {
+      return process.env.FRESHBOOKS_BUSINESS_ID ?? '';
+    },
     authUrl: 'https://auth.freshbooks.com/oauth/authorize',
     tokenUrl: 'https://api.freshbooks.com/auth/oauth/token',
     // Scopes to request — FreshBooks uses space-separated scopes
@@ -45,9 +49,18 @@ export const config = {
     },
     // Public base URL — used to build the OAuth callback URI in HTTP mode
     url: process.env.SERVER_URL ?? 'https://localhost:3443',
+    // Interface the HTTP listener binds to. Loopback unless HOST is set.
+    get bindHost(): string {
+      return resolveBindHost(process.env);
+    },
   },
 };
 
 export function getOAuthCallbackUri(): string {
   return `${config.server.url}/oauth/callback`;
+}
+
+export function resolveBindHost(env: NodeJS.ProcessEnv = process.env): string {
+  const host = (env.HOST ?? '').trim();
+  return host === '' ? '127.0.0.1' : host;
 }
